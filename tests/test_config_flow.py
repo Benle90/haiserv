@@ -60,9 +60,9 @@ _config_entries_mod.ConfigFlow = _FakeConfigFlow
 _data_entry_flow_mod = sys.modules["homeassistant.data_entry_flow"]
 _data_entry_flow_mod.FlowResult = dict
 
-# Provide async_get_clientsession
+# Provide async_create_clientsession
 _aiohttp_client_mod = sys.modules["homeassistant.helpers.aiohttp_client"]
-_aiohttp_client_mod.async_get_clientsession = MagicMock(return_value=MagicMock())
+_aiohttp_client_mod.async_create_clientsession = MagicMock(return_value=MagicMock())
 
 # Remove cached config_flow module to force re-import with our stubs
 if "custom_components.haiserv.config_flow" in sys.modules:
@@ -103,7 +103,7 @@ class TestSuccessfulFlow:
     async def test_successful_flow_creates_entry(self, flow, valid_input):
         """Valid credentials should result in a create_entry response."""
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -130,7 +130,7 @@ class TestSuccessfulFlow:
         }
 
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -165,7 +165,7 @@ class TestInvalidCredentials:
     async def test_invalid_credentials_shows_auth_error(self, flow, valid_input):
         """AuthenticationError should produce 'invalid_auth' error."""
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -185,7 +185,7 @@ class TestInvalidCredentials:
     async def test_auth_error_allows_reentry(self, flow, valid_input):
         """After auth error, the form is shown again for re-entry."""
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -212,7 +212,7 @@ class TestConnectionError:
     async def test_cannot_connect_shows_connection_error(self, flow, valid_input):
         """CannotConnect should produce 'cannot_connect' error."""
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -232,7 +232,7 @@ class TestConnectionError:
     async def test_unexpected_exception_shows_connection_error(self, flow, valid_input):
         """Any unexpected exception should produce 'cannot_connect' error."""
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -252,7 +252,7 @@ class TestConnectionError:
     async def test_connection_error_allows_reentry(self, flow, valid_input):
         """After connection error, the form is shown again for re-entry."""
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -391,7 +391,7 @@ class TestDuplicateDetection:
         flow._abort_if_unique_id_configured = abort_if_configured
 
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -417,7 +417,7 @@ class TestDuplicateDetection:
         flow._abort_if_unique_id_configured = abort_if_configured
 
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -458,7 +458,7 @@ class TestIntegrationHappyPath:
         }
 
         with patch(
-            "custom_components.haiserv.config_flow.async_get_clientsession"
+            "custom_components.haiserv.config_flow.async_create_clientsession"
         ) as mock_session_fn, patch(
             "custom_components.haiserv.config_flow.IServClient"
         ) as MockClient:
@@ -477,3 +477,47 @@ class TestIntegrationHappyPath:
         assert result["data"]["url"] == "https://gymnasium.iserv.de"
         assert result["data"]["username"] == "teacher"
         assert result["data"]["password"] == "securePass!"
+
+
+# --- Test: the login check must not use Home Assistant's shared session ---
+
+
+class TestLoginCheckSession:
+    """The flow logs in on a throwaway session and releases it."""
+
+    @pytest.mark.asyncio
+    async def test_own_session_detached_after_success(self, flow, valid_input):
+        with patch(
+            "custom_components.haiserv.config_flow.async_create_clientsession"
+        ) as mock_session_fn, patch(
+            "custom_components.haiserv.config_flow.IServClient"
+        ) as MockClient:
+            session = MagicMock()
+            mock_session_fn.return_value = session
+            MockClient.return_value.authenticate = AsyncMock()
+
+            result = await flow.async_step_user(valid_input)
+
+        assert result["type"] == "create_entry"
+        mock_session_fn.assert_called_once_with(flow.hass, auto_cleanup=False)
+        assert MockClient.call_args.args[0] is session
+        session.detach.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_own_session_detached_after_failed_login(self, flow, valid_input):
+        with patch(
+            "custom_components.haiserv.config_flow.async_create_clientsession"
+        ) as mock_session_fn, patch(
+            "custom_components.haiserv.config_flow.IServClient"
+        ) as MockClient:
+            session = MagicMock()
+            mock_session_fn.return_value = session
+            MockClient.return_value.authenticate = AsyncMock(
+                side_effect=AuthenticationError("bad credentials")
+            )
+
+            result = await flow.async_step_user(valid_input)
+
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "invalid_auth"}
+        session.detach.assert_called_once_with()

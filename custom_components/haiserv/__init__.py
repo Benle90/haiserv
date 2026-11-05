@@ -107,7 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     Returns:
         True if setup was successful.
     """
-    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+    from homeassistant.helpers.aiohttp_client import async_create_clientsession
     from homeassistant.helpers.update_coordinator import UpdateFailed
     from homeassistant.exceptions import ConfigEntryNotReady
 
@@ -121,8 +121,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     username = entry.data["username"]
     password = entry.data["password"]
 
-    # Create aiohttp session via Home Assistant's session manager
-    session = async_get_clientsession(hass)
+    # iServ logs in with cookies. Home Assistant's shared session has one
+    # cookie jar for all integrations, so two accounts on the same server
+    # would overwrite each other's login. Each entry gets its own session.
+    session = async_create_clientsession(hass)
 
     # Instantiate the iServ API client with a local timetable cache so a
     # temporarily disabled module (e.g. HTTP 403) can serve the last result.
@@ -159,6 +161,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except (UpdateFailed, ConfigEntryNotReady):
         parentletter_coordinator.data = []
     hass.data[DOMAIN][f"{entry.entry_id}_parentletter"] = parentletter_coordinator
+    hass.data[DOMAIN][f"{entry.entry_id}_session"] = session
 
     # Forward platform setup to the sensor module
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -186,5 +189,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_next_week", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_parentletter", None)
+        # Drop the entry's own session (and its cookies). detach() rather than
+        # close(): the connector belongs to Home Assistant.
+        session = hass.data[DOMAIN].pop(f"{entry.entry_id}_session", None)
+        if session is not None:
+            session.detach()
 
     return unload_ok

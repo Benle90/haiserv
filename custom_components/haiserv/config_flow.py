@@ -10,7 +10,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .api import AuthenticationError, CannotConnect, IServClient, validate_url
 from .const import DOMAIN
@@ -53,9 +53,11 @@ class IServConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(f"{username}_{url}")
                 self._abort_if_unique_id_configured()
 
-                # Attempt login with IServClient
+                # Attempt login with IServClient. Use a throwaway session: the
+                # login sets cookies, and on Home Assistant's shared session
+                # they would replace the login of an already configured account.
+                session = async_create_clientsession(self.hass, auto_cleanup=False)
                 try:
-                    session = async_get_clientsession(self.hass)
                     client = IServClient(session, url, username, password)
                     await client.authenticate()
                 except AuthenticationError:
@@ -65,7 +67,9 @@ class IServConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 except Exception:  # noqa: BLE001
                     _LOGGER.exception("Unexpected exception during iServ login")
                     errors["base"] = "cannot_connect"
-                else:
+                finally:
+                    session.detach()
+                if not errors:
                     # Authentication successful — create the config entry
                     return self.async_create_entry(
                         title=f"iServ ({username} @ {url})",

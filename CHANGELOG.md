@@ -17,6 +17,10 @@
 
 ### Fixed
 
+- Several iServ accounts on the same server: every config entry now uses its
+  own HTTP session. Before, all entries shared Home Assistant's session and
+  its cookie jar, so a second login replaced the first account's session.
+
 - Elternbrief detail parser: a letter body containing nested `<div>`s was cut
   off at the first closing `</div>`.
 
