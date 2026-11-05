@@ -7,8 +7,12 @@ from datetime import datetime
 import pytest
 
 from custom_components.haiserv.parentletter_parser import (
+    MAX_BODY_CHARS,
     ParentLetter,
+    extract_attachments,
     extract_csrf_token,
+    html_to_text,
+    parentletter_response,
     parse_parentletter_detail,
     parse_parentletter_list,
 )
@@ -328,3 +332,177 @@ class TestExtractCsrfToken:
     def test_handles_reversed_attribute_order(self) -> None:
         html = "<input type='hidden' value='rev-tok' name='_token'>"
         assert extract_csrf_token(html) == "rev-tok"
+
+
+# ---------------------------------------------------------------------------
+# Detail body with nested markup, plain text, attachments, service response
+# ---------------------------------------------------------------------------
+
+_DETAIL_NESTED_HTML = f"""
+<html><body>
+<nav><a href="/iserv/file/-/">Dateien</a></nav>
+<div class="parent-show">
+  <h2 class="translatable-content">Wandertag &amp; Mottotag</h2>
+  <table>
+    <tr><td class="pr-2"><strong>Kind</strong></td><td>Max Mustermann</td></tr>
+    <tr><td class="pr-2"><strong>Versandzeitpunkt</strong></td><td>12.10.2026 07:45</td></tr>
+  </table>
+  <div class="parent-letter-body translatable-content editor-content">
+    <div class="intro"><p>Liebe Eltern,</p></div>
+    <p>am 19.10. ist Wandertag.<br>Treffpunkt: 8&nbsp;Uhr am Schulhof.</p>
+    <ul><li>Rucksack</li><li>Getr&auml;nk</li></ul>
+    <div><p>Mehr unter <a href="https://example.org/file.pdf">diesem Link</a>.</p></div>
+    <script>alert("x")</script>
+  </div>
+  <div class="attachments">
+    <a href="/iserv/parentletter/parent/file/{LETTER_UUID}/1/Einverst%C3%A4ndnis.pdf">Einverständnis.pdf</a>
+    <a href="/iserv/parentletter/parent/file/{LETTER_UUID}/2/Plan.pdf?download=1"></a>
+    <a href="/iserv/somewhere/else" download>Liste.xlsx</a>
+    <a href="/iserv/parentletter/parent/index">Zurück</a>
+    <a href="mailto:lehrer@example.org">Antworten</a>
+  </div>
+  <form method="post">
+    <input type="hidden" name="form[_token]" value="tok">
+  </form>
+</div>
+</body></html>
+"""
+
+
+class TestDetailBodyNested:
+    """The letter body must survive nested <div>s."""
+
+    def test_body_keeps_content_after_nested_div(self) -> None:
+        letter = ParentLetter(LETTER_UUID, CHILD_UUID, "s", "a")
+        enriched = parse_parentletter_detail(_DETAIL_NESTED_HTML, letter)
+        assert "Liebe Eltern" in enriched.body_html
+        assert "Wandertag" in enriched.body_html
+        assert "diesem Link" in enriched.body_html
+
+    def test_body_stops_at_its_own_closing_div(self) -> None:
+        letter = ParentLetter(LETTER_UUID, CHILD_UUID, "s", "a")
+        enriched = parse_parentletter_detail(_DETAIL_NESTED_HTML, letter)
+        assert "Einverständnis" not in enriched.body_html
+        assert "form[_token]" not in enriched.body_html
+
+    def test_flat_body_unchanged(self) -> None:
+        letter = ParentLetter(LETTER_UUID, CHILD_UUID, "s", "a")
+        enriched = parse_parentletter_detail(_DETAIL_HTML, letter)
+        assert enriched.body_html == (
+            "<p>Liebe Eltern, wir planen einen Ausflug nach Berlin.</p>"
+        )
+
+    def test_body_cut_off_by_eof_is_kept(self) -> None:
+        html = '<div class="parent-letter-body"><p>Anfang</p><div>Rest'
+        letter = ParentLetter(LETTER_UUID, CHILD_UUID, "s", "a")
+        assert "Rest" in parse_parentletter_detail(html, letter).body_html
+
+
+class TestHtmlToText:
+    """Tests for html_to_text()."""
+
+    def test_empty(self) -> None:
+        assert html_to_text("") == ""
+        assert html_to_text("   ") == ""
+
+    def test_blocks_become_lines(self) -> None:
+        text = html_to_text("<p>Eins</p><p>Zwei<br>Drei</p>")
+        assert text.split("\n") == ["Eins", "", "Zwei", "Drei"]
+
+    def test_list_items(self) -> None:
+        text = html_to_text("<ul><li>Rucksack</li><li>Getr&auml;nk</li></ul>")
+        assert "- Rucksack" in text
+        assert "- Getränk" in text
+
+    def test_entities_and_nbsp(self) -> None:
+        assert html_to_text("<p>8&nbsp;Uhr &amp; sp&#228;ter</p>") == "8 Uhr & später"
+
+    def test_script_and_style_dropped(self) -> None:
+        text = html_to_text("<p>a</p><script>alert(1)</script><style>p{}</style><p>b</p>")
+        assert "alert" not in text
+        assert "p{}" not in text
+        assert text.split("\n") == ["a", "", "b"]
+
+    def test_no_tags_left(self) -> None:
+        letter = ParentLetter(LETTER_UUID, CHILD_UUID, "s", "a")
+        body = parse_parentletter_detail(_DETAIL_NESTED_HTML, letter).body_html
+        text = html_to_text(body)
+        assert "<" not in text and ">" not in text
+        assert "Treffpunkt: 8 Uhr am Schulhof." in text
+
+
+class TestExtractAttachments:
+    """Tests for extract_attachments()."""
+
+    def test_names_in_document_order(self) -> None:
+        assert extract_attachments(_DETAIL_NESTED_HTML) == [
+            "Einverständnis.pdf",
+            "Plan.pdf",
+            "Liste.xlsx",
+        ]
+
+    def test_links_in_body_and_navigation_ignored(self) -> None:
+        names = extract_attachments(_DETAIL_NESTED_HTML)
+        assert "diesem Link" not in names
+        assert "Zurück" not in names
+        assert "Dateien" not in names
+        assert "Antworten" not in names
+
+    def test_no_container_returns_empty(self) -> None:
+        assert extract_attachments('<a href="/x/file/a.pdf">a.pdf</a>') == []
+        assert extract_attachments("") == []
+
+    def test_letter_without_attachments(self) -> None:
+        assert extract_attachments(_DETAIL_HTML) == []
+
+
+class TestParentletterResponse:
+    """Tests for parentletter_response()."""
+
+    URL = f"https://school.example/iserv/parentletter/parent/show/{LETTER_UUID}/{CHILD_UUID}"
+
+    def _letter(self) -> ParentLetter:
+        return ParentLetter(
+            letter_uuid=LETTER_UUID,
+            child_uuid=CHILD_UUID,
+            subject="Aus der Liste",
+            sender="Frau Müller",
+            is_unread=True,
+        )
+
+    def test_fields(self) -> None:
+        response = parentletter_response(_DETAIL_NESTED_HTML, self._letter(), self.URL)
+        assert response["letter_uuid"] == LETTER_UUID
+        assert response["child_uuid"] == CHILD_UUID
+        assert response["subject"] == "Wandertag & Mottotag"
+        assert response["sender"] == "Frau Müller"
+        assert response["child"] == "Max Mustermann"
+        assert response["created_at"] == "2026-10-12T07:45:00"
+        assert response["is_unread"] is True
+        assert response["url"] == self.URL
+        assert response["truncated"] is False
+        assert response["attachments"] == [
+            "Einverständnis.pdf",
+            "Plan.pdf",
+            "Liste.xlsx",
+        ]
+        assert "am 19.10. ist Wandertag." in response["body_text"]
+
+    def test_json_serialisable(self) -> None:
+        import json
+
+        response = parentletter_response(_DETAIL_NESTED_HTML, self._letter(), self.URL)
+        assert json.loads(json.dumps(response)) == response
+
+    def test_empty_page_keeps_list_values(self) -> None:
+        response = parentletter_response("", self._letter(), self.URL)
+        assert response["subject"] == "Aus der Liste"
+        assert response["body_text"] == ""
+        assert response["attachments"] == []
+
+    def test_long_body_truncated(self) -> None:
+        body = "<p>" + ("x" * (MAX_BODY_CHARS + 50)) + "</p>"
+        html = f'<div class="parent-show"><div class="parent-letter-body">{body}</div></div>'
+        response = parentletter_response(html, self._letter(), self.URL)
+        assert response["truncated"] is True
+        assert len(response["body_text"]) == MAX_BODY_CHARS

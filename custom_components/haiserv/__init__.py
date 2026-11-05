@@ -14,6 +14,86 @@ PLATFORMS = ["sensor"]
 _LOGGER = logging.getLogger(__name__)
 
 
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the integration's services.
+
+    Services are registered once per Home Assistant run, independent of the
+    config entries; the entry to use is a service field.
+
+    Args:
+        hass: The Home Assistant instance.
+        config: The YAML configuration (unused; the integration is UI-only).
+
+    Returns:
+        True.
+    """
+    import voluptuous as vol
+    from homeassistant.core import SupportsResponse
+    from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+
+    from .api import AuthenticationError, CannotConnect
+    from .const import DOMAIN, SERVICE_GET_PARENT_LETTER
+    from .parentletter_parser import ParentLetter, parentletter_response
+
+    uuid = vol.All(
+        str,
+        vol.Match(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        ),
+    )
+    schema = vol.Schema(
+        {
+            vol.Required("config_entry_id"): str,
+            vol.Required("letter_uuid"): uuid,
+            vol.Required("child_uuid"): uuid,
+        }
+    )
+
+    async def _get_parent_letter(call):
+        """Fetch one Elternbrief and return its text. Reads only."""
+        entry_id = call.data["config_entry_id"]
+        letter_uuid = call.data["letter_uuid"].lower()
+        child_uuid = call.data["child_uuid"].lower()
+
+        coordinator = hass.data.get(DOMAIN, {}).get(f"{entry_id}_parentletter")
+        if coordinator is None:
+            raise ServiceValidationError(
+                f"No loaded HAiServ config entry with id {entry_id}"
+            )
+
+        letter = next(
+            (
+                item
+                for item in coordinator.data or []
+                if item.letter_uuid.lower() == letter_uuid
+                and item.child_uuid.lower() == child_uuid
+            ),
+            ParentLetter(
+                letter_uuid=letter_uuid, child_uuid=child_uuid, subject="", sender=""
+            ),
+        )
+        client = coordinator.client
+        try:
+            html = await client.fetch_parentletter_detail(letter_uuid, child_uuid)
+        except AuthenticationError as err:
+            raise HomeAssistantError(f"iServ authentication failed: {err}") from err
+        except CannotConnect as err:
+            raise HomeAssistantError(f"Cannot fetch the Elternbrief: {err}") from err
+
+        return parentletter_response(
+            html, letter, client.parentletter_url(letter_uuid, child_uuid)
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_PARENT_LETTER,
+        _get_parent_letter,
+        schema=schema,
+        supports_response=SupportsResponse.ONLY,
+    )
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up iServ from a config entry.
 

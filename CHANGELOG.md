@@ -4,11 +4,21 @@
 
 ### Added
 
+- Action `haiserv.get_parent_letter` (response only): returns one Elternbrief
+  as plain text — subject, sender, date, `body_text`, attachment names and the
+  iServ link — for the account of the given config entry. It only reads; the
+  letter is not marked as read by the action itself.
+
 - Local timetable cache: a failed fetch (for example HTTP 403 after a school
   disabled the timetable for parents and students) now falls back to the last
   successfully fetched timetable instead of failing. Only the latest successful
   version is kept per timetable (current and next week separately). The timetable
   sensor exposes the fallback via the `cached` state attribute.
+
+### Fixed
+
+- Elternbrief detail parser: a letter body containing nested `<div>`s was cut
+  off at the first closing `</div>`.
 
 ## [0.1.0] — 2026-09-18
 

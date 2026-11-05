@@ -1,0 +1,17 @@
+get_parent_letter:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: haiserv
+    letter_uuid:
+      required: true
+      example: "aabbccdd-1111-2222-3333-444455556666"
+      selector:
+        text:
+    child_uuid:
+      required: true
+      example: "99887766-aaaa-bbbb-cccc-ddddeeeeffff"
+      selector:
+        text:

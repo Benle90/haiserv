@@ -526,6 +526,13 @@ class IServClient:
             await self.authenticate()
             return await self._do_fetch_page(url)
 
+    def parentletter_url(self, letter_uuid: str, child_uuid: str) -> str:
+        """Return the browser URL of one Elternbrief detail page."""
+        path = self.PARENTLETTER_SHOW_PATH.format(
+            letter_uuid=letter_uuid, child_uuid=child_uuid
+        )
+        return f"{self._base_url}{path}"
+
     async def fetch_parentletter_detail(
         self, letter_uuid: str, child_uuid: str
     ) -> str:

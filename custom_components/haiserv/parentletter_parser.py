@@ -6,7 +6,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import unescape
 from html.parser import HTMLParser
+from urllib.parse import unquote, urlparse
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -281,6 +283,285 @@ def parse_parentletter_list(html: str) -> list[ParentLetter]:
 
 
 # ---------------------------------------------------------------------------
+# Detail-view helpers
+# ---------------------------------------------------------------------------
+
+
+class _DivContentCollector(HTMLParser):
+    """Collect the inner HTML of the first <div> whose class contains a token.
+
+    Only <div> nesting is counted, so unclosed inline or void elements inside
+    the target cannot end the capture early or late.
+    """
+
+    def __init__(self, class_token: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self._token = class_token
+        self._depth: int = 0
+        self._parts: list[str] = []
+        self.content: str | None = None
+
+    @property
+    def _capturing(self) -> bool:
+        return self._depth > 0 and self.content is None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.content is not None:
+            return
+        if self._depth == 0:
+            if tag == "div" and self._token in (dict(attrs).get("class") or ""):
+                self._depth = 1
+            return
+        if tag == "div":
+            self._depth += 1
+        self._parts.append(self.get_starttag_text() or f"<{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._capturing:
+            self._parts.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._capturing:
+            return
+        if tag == "div":
+            self._depth -= 1
+            if self._depth == 0:
+                self.content = "".join(self._parts).strip()
+                return
+        self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._capturing:
+            self._parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self._capturing:
+            self._parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._capturing:
+            self._parts.append(f"&#{name};")
+
+    def finish(self) -> str | None:
+        """Return the captured content; a body cut off by EOF is kept."""
+        if self.content is None and self._depth > 0:
+            self.content = "".join(self._parts).strip()
+        return self.content
+
+
+def _extract_div_content(html: str, class_token: str) -> str | None:
+    """Return the inner HTML of the first <div> with *class_token* in its class."""
+    collector = _DivContentCollector(class_token)
+    try:
+        collector.feed(html)
+        collector.close()
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning("Failed to extract <div class=%s> from Elternbrief HTML", class_token)
+    return collector.finish()
+
+
+_BLOCK_TAGS = frozenset({
+    "article", "blockquote", "br", "div", "footer", "h1", "h2", "h3", "h4",
+    "h5", "h6", "header", "hr", "li", "ol", "p", "pre", "section", "table",
+    "tr", "ul",
+})
+_SKIP_TAGS = frozenset({"head", "script", "style", "template"})
+
+
+class _TextExtractor(HTMLParser):
+    """Turn an HTML fragment into plain text with one line per block element."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip: int = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _SKIP_TAGS:
+            self._skip += 1
+            return
+        if self._skip:
+            return
+        if tag == "li":
+            self.parts.append("\n- ")
+        elif tag in ("td", "th"):
+            self.parts.append(" ")
+        elif tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _SKIP_TAGS:
+            self._skip = max(0, self._skip - 1)
+            return
+        if self._skip:
+            return
+        if tag in _BLOCK_TAGS and tag != "br":
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(html: str) -> str:
+    """Convert an HTML fragment to plain text.
+
+    Tags are removed, entities decoded, block elements become line breaks and
+    list items start with "- ". Runs of blank lines collapse to one.
+    """
+    if not html or not html.strip():
+        return ""
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(html)
+        extractor.close()
+    except Exception:  # noqa: BLE001
+        return _strip_tags(html)
+    text = "".join(extractor.parts).replace("\xa0", " ")
+    lines: list[str] = []
+    for raw_line in text.split("\n"):
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+# Links inside the detail view that are navigation, not attachments.
+_NON_ATTACHMENT_PATHS = (
+    "/parentletter/parent/show/",
+    "/parentletter/parent/mark-as-read/",
+    "/parentletter/parent/index",
+)
+_ATTACHMENT_HINT = re.compile(r"file|attachment|anhang|download|/fs/", re.IGNORECASE)
+
+
+class _LinkCollector(HTMLParser):
+    """Collect <a> links, skipping those inside the letter body."""
+
+    def __init__(self, skip_class_token: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_token = skip_class_token
+        self._skip_depth: int = 0
+        self._current: dict[str, object] | None = None
+        self.links: list[dict[str, object]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        if tag == "div":
+            if self._skip_depth:
+                self._skip_depth += 1
+            elif self._skip_token in (attr_map.get("class") or ""):
+                self._skip_depth = 1
+            return
+        if tag == "a" and not self._skip_depth:
+            self._current = {
+                "href": attr_map.get("href") or "",
+                "download": "download" in attr_map,
+                "text": [],
+            }
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "div" and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag == "a" and self._current is not None:
+            self.links.append(self._current)
+            self._current = None
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            self._current["text"].append(data)  # type: ignore[union-attr]
+
+
+def extract_attachments(html: str) -> list[str]:
+    """Return the names of the attachments listed on an Elternbrief detail page.
+
+    Looks only inside ``<div class="parent-show">`` and outside the letter
+    body, so navigation links and links written into the letter text are not
+    reported. A link counts as an attachment when it carries a ``download``
+    attribute or its path looks like a file download.
+
+    Args:
+        html: Full HTML of the detail view.
+
+    Returns:
+        Attachment names in document order, without duplicates.
+    """
+    container = _extract_div_content(html or "", "parent-show")
+    if not container:
+        return []
+    collector = _LinkCollector("parent-letter-body")
+    try:
+        collector.feed(container)
+        collector.close()
+    except Exception:  # noqa: BLE001
+        return []
+
+    names: list[str] = []
+    candidates: list[str] = []
+    for link in collector.links:
+        href = str(link["href"]).strip()
+        if not href or href.startswith(("#", "mailto:", "javascript:", "tel:")):
+            continue
+        path = urlparse(href).path
+        candidates.append(path)
+        if any(marker in path for marker in _NON_ATTACHMENT_PATHS):
+            continue
+        if not (link["download"] or _ATTACHMENT_HINT.search(path)):
+            continue
+        text = re.sub(r"\s+", " ", "".join(link["text"])).strip()  # type: ignore[arg-type]
+        name = text or unquote(path.rstrip("/").rsplit("/", 1)[-1])
+        if name and name not in names:
+            names.append(name)
+    # Paths only (UUIDs, no query strings): lets a wrong guess about iServ's
+    # attachment markup be diagnosed from the debug log.
+    _LOGGER.debug("Elternbrief detail links outside the body: %s", candidates)
+    return names
+
+
+# Upper bound for the plain-text body handed to callers (e.g. an AI task).
+MAX_BODY_CHARS = 20000
+
+
+def parentletter_response(
+    html: str, letter: ParentLetter, url: str
+) -> dict[str, object]:
+    """Build the response of the ``get_parent_letter`` service.
+
+    Args:
+        html: Full HTML of the detail view.
+        letter: The letter as known from the list view (or a stub with only
+            the two UUIDs).
+        url: Browser URL of the detail view.
+
+    Returns:
+        JSON-serialisable dict with the letter's metadata, its body as plain
+        text and the names of its attachments.
+    """
+    enriched = parse_parentletter_detail(html, letter)
+    body_text = html_to_text(enriched.body_html)
+    return {
+        "letter_uuid": enriched.letter_uuid,
+        "child_uuid": enriched.child_uuid,
+        # The list/detail parsers keep HTML entities; decode them here.
+        "subject": unescape(enriched.subject),
+        "sender": unescape(enriched.sender),
+        "additional_senders": [unescape(s) for s in enriched.additional_senders],
+        "child": unescape(enriched.child),
+        "recipient": unescape(enriched.recipient),
+        "created_at": (
+            enriched.created_at.isoformat() if enriched.created_at else None
+        ),
+        # Read state as of the last list poll; fetching the detail does not
+        # refresh it.
+        "is_unread": letter.is_unread,
+        "body_text": body_text[:MAX_BODY_CHARS],
+        "truncated": len(body_text) > MAX_BODY_CHARS,
+        "attachments": extract_attachments(html),
+        "url": url,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Detail-view parser
 # ---------------------------------------------------------------------------
 
@@ -331,14 +612,10 @@ def parse_parentletter_detail(html: str, letter: ParentLetter) -> ParentLetter:
         enriched.subject = _strip_tags(h2_match.group(1))
 
     # --- body from <div class="parent-letter-body …"> ---
-    # Use a non-greedy match that stops at the first </div> after the opening tag.
-    body_match = re.search(
-        r'<div[^>]*class="[^"]*parent-letter-body[^"]*"[^>]*>(.*?)</div>',
-        html,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if body_match:
-        enriched.body_html = body_match.group(1).strip()
+    # Depth-aware, so nested <div>s inside the letter do not cut the body short.
+    body_html = _extract_div_content(html, "parent-letter-body")
+    if body_html is not None:
+        enriched.body_html = body_html
 
     # --- metadata: try <table> rows first (real iServ), fall back to <dl> ---
     # Real iServ detail page uses:

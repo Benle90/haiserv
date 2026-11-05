@@ -23,5 +23,25 @@
     "create_entry": {
       "default": "Successfully connected to {url}. Your credentials have been validated."
     }
+  },
+  "services": {
+    "get_parent_letter": {
+      "name": "Get parent letter",
+      "description": "Returns the text of one Elternbrief (subject, sender, date, plain-text body, attachment names, link). Reads only; the letter is not marked as read by this action.",
+      "fields": {
+        "config_entry_id": {
+          "name": "iServ account",
+          "description": "The HAiServ entry whose iServ session reads the letter."
+        },
+        "letter_uuid": {
+          "name": "Letter UUID",
+          "description": "letter_uuid from the parent letter sensor's letters attribute."
+        },
+        "child_uuid": {
+          "name": "Child UUID",
+          "description": "child_uuid from the parent letter sensor's letters attribute."
+        }
+      }
+    }
   }
 }

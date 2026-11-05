@@ -22,3 +22,6 @@ DAY_ORDER = {
     "Thursday": 3,
     "Friday": 4,
 }
+
+# Service returning the text of one Elternbrief (response only)
+SERVICE_GET_PARENT_LETTER = "get_parent_letter"
